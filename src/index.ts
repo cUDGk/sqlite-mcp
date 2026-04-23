@@ -20,6 +20,22 @@ const registry = new Map<string, Handle>();
 const DEFAULT_NAME = "default";
 const MAX_ROWS = parseInt(process.env.SQLITE_MAX_ROWS ?? "1000", 10);
 
+// Some LLM tool-call paths deliver object/array arguments as JSON strings.
+// Parse those back into structured values before use.
+function coerceObject<T>(v: unknown): T | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v === "string") {
+    const s = v.trim();
+    if (s === "") return undefined;
+    try {
+      return JSON.parse(s) as T;
+    } catch (e: any) {
+      throw new Error(`failed to parse JSON string argument: ${e.message}`);
+    }
+  }
+  return v as T;
+}
+
 function getHandle(name?: string): Handle {
   const n = name ?? DEFAULT_NAME;
   const h = registry.get(n);
@@ -397,13 +413,13 @@ params may be an array (positional ?) or object (named @name / :name / $name).`,
     path: z.string().optional().describe("open/import_csv: file path"),
     readonly: z.boolean().optional().describe("open: open as readonly"),
     create: z.boolean().optional().describe("open: allow create if missing (default true)"),
-    pragmas: z.array(z.string()).optional().describe("open: PRAGMAs to apply on open"),
+    pragmas: z.union([z.array(z.string()), z.string()]).optional().describe("open: PRAGMAs to apply on open"),
     sql: z.string().optional().describe("query/execute/execute_script/explain/export_*: SQL text"),
     params: z.any().optional().describe("query/execute/explain/export_*: positional array or named object"),
     limit: z.number().int().positive().optional().describe("query: row cap (default 1000)"),
     table: z.string().optional().describe("schema/import_csv: table name"),
     pragma: z.string().optional().describe("pragma: pragma expression"),
-    statements: z.array(z.object({ sql: z.string(), params: z.any().optional() })).optional().describe("transaction: list of prepared statements"),
+    statements: z.union([z.array(z.object({ sql: z.string(), params: z.any().optional() })), z.string()]).optional().describe("transaction: list of prepared statements"),
     dest_path: z.string().optional().describe("backup/vacuum(INTO): destination path"),
     schema_name: z.string().optional().describe("attach/detach: schema alias"),
     // csv i/o
@@ -412,19 +428,24 @@ params may be an array (positional ?) or object (named @name / :name / $name).`,
     header: z.boolean().optional().describe("export_csv: write header row (default true)"),
     create_table: z.boolean().optional().describe("import_csv: auto-CREATE if missing (default true)"),
     replace_table: z.boolean().optional().describe("import_csv: DROP + recreate if exists"),
-    columns: z.array(z.string()).optional().describe("import_csv: explicit column names"),
+    columns: z.union([z.array(z.string()), z.string()]).optional().describe("import_csv: explicit column names"),
     batch_size: z.number().int().positive().optional().describe("import_csv: rows per transaction (default 1000)"),
-    null_tokens: z.array(z.string()).optional().describe("import_csv: strings treated as NULL (default ['', 'NULL', 'null', '\\\\N'])"),
+    null_tokens: z.union([z.array(z.string()), z.string()]).optional().describe("import_csv: strings treated as NULL (default ['', 'NULL', 'null', '\\\\N'])"),
     output_path: z.string().optional().describe("export_csv/export_json: destination path"),
     pretty: z.boolean().optional().describe("export_json: pretty-print"),
     ndjson: z.boolean().optional().describe("export_json: one-object-per-line"),
   },
   async (p) => {
     try {
+      const params = coerceObject<unknown[] | Record<string, unknown>>(p.params);
+      const pragmas = coerceObject<string[]>(p.pragmas);
+      const statements = coerceObject<Array<{ sql: string; params?: unknown }>>(p.statements);
+      const columns = coerceObject<string[]>(p.columns);
+      const nullTokens = coerceObject<string[]>(p.null_tokens);
       switch (p.action) {
         case "open": {
           if (!p.path) return errContent("open requires 'path'");
-          const h = openDb({ path: p.path, name: p.name, readonly: p.readonly, create: p.create, pragmas: p.pragmas });
+          const h = openDb({ path: p.path, name: p.name, readonly: p.readonly, create: p.create, pragmas });
           return textContent({ opened: true, name: h.name, path: h.path, readonly: h.readonly });
         }
         case "close":
@@ -433,19 +454,22 @@ params may be an array (positional ?) or object (named @name / :name / $name).`,
           return textContent(listOpen());
         case "query": {
           if (!p.sql) return errContent("query requires 'sql'");
-          return textContent(runQuery(getHandle(p.name), p.sql, p.params, p.limit));
+          return textContent(runQuery(getHandle(p.name), p.sql, params, p.limit));
         }
         case "execute": {
           if (!p.sql) return errContent("execute requires 'sql'");
-          return textContent(runExec(getHandle(p.name), p.sql, p.params));
+          return textContent(runExec(getHandle(p.name), p.sql, params));
         }
         case "execute_script": {
           if (!p.sql) return errContent("execute_script requires 'sql'");
           return textContent(runExecScript(getHandle(p.name), p.sql));
         }
         case "transaction": {
-          if (!p.statements) return errContent("transaction requires 'statements'");
-          return textContent(runTransaction(getHandle(p.name), p.statements));
+          if (!statements) return errContent("transaction requires 'statements'");
+          return textContent(runTransaction(getHandle(p.name), statements.map((s) => ({
+            sql: s.sql,
+            params: coerceObject<unknown[] | Record<string, unknown>>(s.params),
+          }))));
         }
         case "schema":
           return textContent(getSchema(getHandle(p.name), p.table));
@@ -459,7 +483,7 @@ params may be an array (positional ?) or object (named @name / :name / $name).`,
         }
         case "explain": {
           if (!p.sql) return errContent("explain requires 'sql'");
-          return textContent(runExplain(getHandle(p.name), p.sql, p.params));
+          return textContent(runExplain(getHandle(p.name), p.sql, params));
         }
         case "vacuum":
           return textContent(runVacuum(getHandle(p.name), p.dest_path));
@@ -479,21 +503,21 @@ params may be an array (positional ?) or object (named @name / :name / $name).`,
             path: p.path, table: p.table,
             delimiter: p.delimiter, has_header: p.has_header,
             create_table: p.create_table, replace_table: p.replace_table,
-            columns: p.columns, batch_size: p.batch_size,
-            null_tokens: p.null_tokens,
+            columns, batch_size: p.batch_size,
+            null_tokens: nullTokens,
           }));
         }
         case "export_csv": {
           if (!p.sql || !p.output_path) return errContent("export_csv requires 'sql' and 'output_path'");
           return textContent(exportCsv(getHandle(p.name), {
-            sql: p.sql, params: p.params, output_path: p.output_path,
+            sql: p.sql, params, output_path: p.output_path,
             delimiter: p.delimiter, header: p.header,
           }));
         }
         case "export_json": {
           if (!p.sql || !p.output_path) return errContent("export_json requires 'sql' and 'output_path'");
           return textContent(exportJson(getHandle(p.name), {
-            sql: p.sql, params: p.params, output_path: p.output_path,
+            sql: p.sql, params, output_path: p.output_path,
             pretty: p.pretty, ndjson: p.ndjson,
           }));
         }
