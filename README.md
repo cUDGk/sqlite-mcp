@@ -32,6 +32,12 @@
 | `schema` | 全オブジェクト列挙。`table` 指定で columns / FKs / indexes |
 | `pragma` | `PRAGMA ...` 直叩き |
 | `backup` | オンラインバックアップ |
+| `explain` | `EXPLAIN QUERY PLAN` で実行計画を構造化 + tree 文字列で返却 |
+| `vacuum` | `VACUUM`、`dest_path` 指定で `VACUUM INTO` に切替 |
+| `attach` / `detach` | `ATTACH DATABASE ... AS <schema_name>` / `DETACH` のラッパー |
+| `list_schemas` | `pragma_database_list` を返却 (`main` / `temp` / attached 一覧) |
+| `import_csv` | CSV を指定テーブルにインポート。型推論 (INTEGER/REAL/TEXT)、`has_header` / `delimiter` / `null_tokens` / `create_table` / `replace_table` / `batch_size` 対応 |
+| `export_csv` / `export_json` | query 結果を `output_path` に書き出し。JSON は `pretty` / `ndjson` 切替 |
 
 ## インストール
 
@@ -78,6 +84,49 @@ claude mcp add sqlite -- node C:/Users/user/Desktop/sqlite-mcp/dist/index.js
   {"sql": "INSERT INTO t VALUES (?)", "params": [1]},
   {"sql": "INSERT INTO t VALUES (?)", "params": [2]}
 ]}
+```
+
+CSV インポート (型自動推論):
+
+```json
+{"action": "import_csv",
+ "path": "C:/data/users.csv",
+ "table": "users",
+ "replace_table": true}
+```
+
+query 結果を CSV に書き出し:
+
+```json
+{"action": "export_csv",
+ "sql": "SELECT name, age FROM users WHERE city = ?",
+ "params": ["Tokyo"],
+ "output_path": "C:/tmp/tokyo.csv"}
+```
+
+NDJSON でストリーミング用に:
+
+```json
+{"action": "export_json",
+ "sql": "SELECT * FROM events",
+ "output_path": "C:/tmp/events.ndjson",
+ "ndjson": true}
+```
+
+EXPLAIN QUERY PLAN で index 効いてるか確認:
+
+```json
+{"action": "explain",
+ "sql": "SELECT * FROM orders WHERE user_id = ? AND status = ?",
+ "params": [42, "paid"]}
+```
+
+別 DB を attach して cross-db join:
+
+```json
+{"action": "attach", "path": "analytics.db", "schema_name": "a"}
+{"action": "query", "sql": "SELECT u.name, COUNT(*) FROM users u JOIN a.events e ON e.user_id = u.id GROUP BY u.id"}
+{"action": "detach", "schema_name": "a"}
 ```
 
 ## 設計メモ
