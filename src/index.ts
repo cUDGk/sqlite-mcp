@@ -3,8 +3,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import Database from "better-sqlite3";
-import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, readFileSync, statSync, writeFileSync, realpathSync } from "node:fs";
+import { resolve, relative, isAbsolute, dirname, basename } from "node:path";
 import { parse as parseCsv } from "csv-parse/sync";
 import { stringify as stringifyCsv } from "csv-stringify/sync";
 
@@ -19,6 +19,172 @@ type Handle = {
 const registry = new Map<string, Handle>();
 const DEFAULT_NAME = "default";
 const MAX_ROWS = parseInt(process.env.SQLITE_MAX_ROWS ?? "1000", 10);
+const ALLOW_DANGEROUS = process.env.SQLITE_ALLOW_DANGEROUS === "1";
+
+// S1: confine FS-touching paths to a root. Default: server CWD.
+// S2: resolve symlinks at startup so attackers can't escape via symlinked roots.
+const ALLOWED_ROOT_RAW = resolve(process.env.SQLITE_ALLOWED_ROOT ?? process.cwd());
+const ALLOWED_ROOT = (() => {
+  try {
+    return realpathSync(ALLOWED_ROOT_RAW);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return ALLOWED_ROOT_RAW;
+    throw e;
+  }
+})();
+
+// S1 helper: resolve the deepest existing ancestor so symlinks in any prefix
+// of a non-existent write path are still caught.
+function realpathBestEffort(p: string): string {
+  try { return realpathSync(p); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+  const parent = dirname(p);
+  if (parent === p) return p;
+  return resolve(realpathBestEffort(parent), basename(p));
+}
+
+// S1 helper: validate that an absolute path is within ALLOWED_ROOT (no string startsWith).
+// S2: realpath the candidate first so symlinks-escape is caught. Write destinations
+// may not exist yet — realpathBestEffort walks ancestors to catch symlinks in parent chain.
+// U9: error message must NOT include ALLOWED_ROOT (info leak); generic only.
+function ensureWithinAllowedRoot(absPath: string): void {
+  const abs = realpathBestEffort(resolve(absPath));
+  const rel = relative(ALLOWED_ROOT, abs);
+  if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) return;
+  throw new Error(
+    `path is outside the allowed root. ` +
+    `Set SQLITE_ALLOWED_ROOT to permit access.`,
+  );
+}
+
+// S7 helper: reject NUL / CR / LF and all other control chars (incl. DEL) in user-supplied paths.
+function sanitizePath(p: string, label: string): string {
+  if (typeof p !== "string" || p.length === 0) throw new Error(`${label}: empty path`);
+  if (/[\x00-\x1f\x7f]/.test(p)) throw new Error(`${label}: path contains control character`);
+  return p;
+}
+
+// Resolve + sanitize + root-confine a user-supplied path.
+function resolveSafePath(p: string, label: string): string {
+  sanitizePath(p, label);
+  const abs = resolve(p);
+  ensureWithinAllowedRoot(abs);
+  return abs;
+}
+
+// S2: SQLite identifier quoting.
+// S6: hard 1000-char cap to prevent pathological identifier names.
+function quoteIdent(name: string): string {
+  if (typeof name !== "string" || !/^[A-Za-z_][A-Za-z0-9_$]*$/.test(name)) {
+    throw new Error(`invalid SQL identifier: ${JSON.stringify(name)}`);
+  }
+  if (name.length > 1000) {
+    throw new Error(`SQL identifier too long (${name.length} > 1000): ${JSON.stringify(name.slice(0, 64) + "…")}`);
+  }
+  return `"${name.replace(/"/g, '""')}"`;
+}
+
+// S9: schema-name validation for ATTACH.
+function validateSchemaName(name: string): string {
+  if (typeof name !== "string" || !/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(name)) {
+    throw new Error(`invalid schema_name: ${JSON.stringify(name)}`);
+  }
+  return name;
+}
+
+// S3: PRAGMA allowlist. Read PRAGMAs allowed; some can also be assigned.
+const PRAGMA_ALLOWLIST = new Set<string>([
+  "journal_mode",
+  "synchronous",
+  "cache_size",
+  "foreign_keys",
+  "table_info",
+  "foreign_key_list",
+  "index_list",
+  "busy_timeout",
+  "recursion_limit",
+  "max_recursion_depth",
+  "page_size",
+  "schema_version",
+  "user_version",
+  "integrity_check",
+  "quick_check",
+  "table_xinfo",
+  "index_info",
+  "function_list",
+  // Used internally + in README examples; safe and useful to inspect.
+  "table_list",
+  "database_list",
+]);
+
+// PRAGMAs we always block, even with ALLOW_DANGEROUS=1, because they enable
+// arbitrary file writes / schema corruption that defeats the SQL-injection guards.
+const PRAGMA_BLOCKLIST = new Set<string>([
+  "writable_schema",
+  "temp_store_directory",
+  "data_store_directory",
+]);
+
+function extractPragmaName(expr: string): string {
+  // Accept "name", "name = value", "name(arg)", "schema.name", etc.
+  // Pull the leading bare-word identifier and lowercase it.
+  const m = /^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)/.exec(expr);
+  if (!m) throw new Error(`invalid pragma expression: ${JSON.stringify(expr)}`);
+  return m[1]!.toLowerCase();
+}
+
+function ensurePragmaAllowed(expr: string): void {
+  if (/;/.test(expr)) throw new Error("pragma expression must not contain semicolons");
+  const name = extractPragmaName(expr);
+  if (PRAGMA_BLOCKLIST.has(name)) {
+    throw new Error(`pragma "${name}" is blocked (writes outside SQL boundary)`);
+  }
+  if (!PRAGMA_ALLOWLIST.has(name) && !ALLOW_DANGEROUS) {
+    throw new Error(
+      `pragma "${name}" is not on the allowlist. ` +
+      `Set SQLITE_ALLOW_DANGEROUS=1 to permit, or use one of: ${[...PRAGMA_ALLOWLIST].join(", ")}.`,
+    );
+  }
+}
+
+// S8: scan execute_script for dangerous statements.
+function ensureScriptSafe(sql: string): void {
+  if (ALLOW_DANGEROUS) return;
+  // Replace block comments with a single space (not empty string) so that
+  // "ATTACH/**/DATABASE" doesn't collapse into "ATTACHDATABASE" and evade the keyword regex.
+  // S1: line comments must also collapse to a single space, otherwise
+  //   ATTACH--evil\nDATABASE  becomes  ATTACHDATABASE  (no whitespace) and \bATTACH\b misses.
+  const stripped = sql
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/--[^\n]*/g, " ");
+  // SQLite grammar: ATTACH [DATABASE] expr AS name  — DATABASE keyword is optional.
+  if (/\bATTACH\b/i.test(stripped)) {
+    throw new Error(
+      "execute_script: ATTACH is forbidden in scripts. " +
+      "Use action=attach instead, or set SQLITE_ALLOW_DANGEROUS=1.",
+    );
+  }
+  // S4: scan EVERY `PRAGMA <name>` occurrence and run it through the blocklist,
+  // not just `writable_schema`. This catches `temp_store_directory` etc. that
+  // were previously accepted in scripts.
+  const pragmaRe = /\bPRAGMA\s+((?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?[A-Za-z_][A-Za-z0-9_]*)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = pragmaRe.exec(stripped)) !== null) {
+    const name = extractPragmaName(m[1]!);
+    if (PRAGMA_BLOCKLIST.has(name)) {
+      throw new Error(
+        `execute_script: PRAGMA ${name} is blocked.`,
+      );
+    }
+    if (!PRAGMA_ALLOWLIST.has(name) && !ALLOW_DANGEROUS) {
+      throw new Error(
+        `execute_script: PRAGMA ${name} is not on the allowlist. ` +
+        `Set SQLITE_ALLOW_DANGEROUS=1 to permit, or use one of: ${[...PRAGMA_ALLOWLIST].join(", ")}.`,
+      );
+    }
+  }
+}
 
 // Some LLM tool-call paths deliver object/array arguments as JSON strings.
 // Parse those back into structured values before use.
@@ -56,16 +222,26 @@ function openDb(p: {
     try { existing.db.close(); } catch {}
     registry.delete(n);
   }
-  const abs = resolve(p.path);
+  const abs = resolveSafePath(p.path, "open.path");
   const readonly = p.readonly === true;
   const exists = existsSync(abs);
   if (!exists && p.create === false) {
     throw new Error(`file not found: ${abs} (create=false)`);
   }
   const db = new Database(abs, { readonly, fileMustExist: p.create === false });
+
+  // S6: every opened DB gets sane busy/recursion settings.
+  try { db.pragma("busy_timeout = 5000"); } catch {}
+  try { db.pragma("max_recursion_depth = 1000"); } catch {}
+
   for (const pr of p.pragmas ?? []) {
-    try { db.pragma(pr); } catch (e: any) {
-      throw new Error(`invalid pragma "${pr}": ${e.message}`);
+    try {
+      ensurePragmaAllowed(pr);
+      db.pragma(pr);
+    } catch (e: unknown) {
+      try { db.close(); } catch {}
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(`invalid pragma "${pr}": ${msg}`);
     }
   }
   const h: Handle = { name: n, path: abs, db, readonly, opened_at: Date.now() };
@@ -109,6 +285,7 @@ function runExec(h: Handle, sql: string, params?: unknown[] | Record<string, unk
 
 function runExecScript(h: Handle, sql: string) {
   if (h.readonly) throw new Error(`db "${h.name}" is readonly`);
+  ensureScriptSafe(sql); // S8
   h.db.exec(sql);
   return { ok: true };
 }
@@ -136,9 +313,10 @@ function runTransaction(h: Handle, statements: Array<{ sql: string; params?: unk
 
 function getSchema(h: Handle, table?: string) {
   if (table) {
-    const info = h.db.prepare(`PRAGMA table_info(${JSON.stringify(table)})`).all();
-    const fks = h.db.prepare(`PRAGMA foreign_key_list(${JSON.stringify(table)})`).all();
-    const idxs = h.db.prepare(`PRAGMA index_list(${JSON.stringify(table)})`).all();
+    // S2: switch to table-valued PRAGMA functions with bound parameters.
+    const info = h.db.prepare("SELECT * FROM pragma_table_info(?)").all(table);
+    const fks = h.db.prepare("SELECT * FROM pragma_foreign_key_list(?)").all(table);
+    const idxs = h.db.prepare("SELECT * FROM pragma_index_list(?)").all(table);
     const create = h.db.prepare("SELECT sql FROM sqlite_master WHERE type IN ('table','view') AND name = ?").get(table) as { sql?: string } | undefined;
     return { table, columns: info, foreign_keys: fks, indexes: idxs, create_sql: create?.sql ?? null };
   }
@@ -147,6 +325,7 @@ function getSchema(h: Handle, table?: string) {
 }
 
 function runPragma(h: Handle, pragma: string) {
+  ensurePragmaAllowed(pragma); // S3 + S8
   const out = h.db.pragma(pragma);
   return { pragma, result: out };
 }
@@ -177,8 +356,9 @@ function runExplain(h: Handle, sql: string, params?: unknown[] | Record<string, 
 
 function runVacuum(h: Handle, intoPath?: string) {
   if (h.readonly) throw new Error(`db "${h.name}" is readonly`);
-  if (intoPath) {
-    const abs = resolve(intoPath);
+  if (intoPath !== undefined) {
+    // S7: sanitize + root-confine the destination.
+    const abs = resolveSafePath(intoPath, "vacuum.dest_path");
     h.db.exec(`VACUUM INTO '${abs.replace(/'/g, "''")}'`);
     return { ok: true, into: abs };
   }
@@ -187,17 +367,24 @@ function runVacuum(h: Handle, intoPath?: string) {
 }
 
 function runAttach(h: Handle, path: string, schemaName: string) {
-  if (schemaName === "main" || schemaName === "temp") throw new Error(`cannot attach as reserved schema "${schemaName}"`);
-  const abs = resolve(path);
+  validateSchemaName(schemaName); // S9
+  if (schemaName === "main" || schemaName === "temp") {
+    throw new Error(`cannot attach as reserved schema "${schemaName}"`);
+  }
+  const abs = resolveSafePath(path, "attach.path"); // S1
   const stmt = h.db.prepare("SELECT name FROM pragma_database_list WHERE name = ?");
   if (stmt.get(schemaName)) throw new Error(`schema already attached: ${schemaName}`);
-  h.db.prepare(`ATTACH DATABASE ? AS ${JSON.stringify(schemaName)}`).run(abs);
+  // S2: ATTACH ... AS <ident> — schema name validated above; quote identifier safely.
+  h.db.prepare(`ATTACH DATABASE ? AS ${quoteIdent(schemaName)}`).run(abs);
   return { attached: true, schema: schemaName, path: abs };
 }
 
 function runDetach(h: Handle, schemaName: string) {
-  if (schemaName === "main" || schemaName === "temp") throw new Error(`cannot detach reserved schema "${schemaName}"`);
-  h.db.exec(`DETACH DATABASE ${JSON.stringify(schemaName)}`);
+  validateSchemaName(schemaName);
+  if (schemaName === "main" || schemaName === "temp") {
+    throw new Error(`cannot detach reserved schema "${schemaName}"`);
+  }
+  h.db.exec(`DETACH DATABASE ${quoteIdent(schemaName)}`); // S2
   return { detached: true, schema: schemaName };
 }
 
@@ -252,8 +439,7 @@ function importCsv(h: Handle, p: {
   null_tokens?: string[];
 }) {
   if (h.readonly) throw new Error(`db "${h.name}" is readonly`);
-  const abs = resolve(p.path);
-  if (!existsSync(abs)) throw new Error(`csv not found: ${abs}`);
+  const abs = resolveSafePath(p.path, "import_csv.path"); // S1
   const content = readFileSync(abs, "utf8");
   const records = parseCsv(content, {
     delimiter: p.delimiter ?? ",",
@@ -263,6 +449,9 @@ function importCsv(h: Handle, p: {
     bom: true,
   }) as any[];
   if (records.length === 0) return { imported: 0, table: p.table };
+
+  // S2: validate table identifier upfront — quoteIdent throws on bad names.
+  const tableIdent = quoteIdent(p.table);
 
   let columns: string[];
   let rows: unknown[][];
@@ -275,9 +464,12 @@ function importCsv(h: Handle, p: {
     rows = records as any[][];
   }
 
+  // S2: each column name validated by quoteIdent.
+  const colIdents = columns.map(quoteIdent);
+
   const tableExistsQuery = h.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?");
   if (p.replace_table && tableExistsQuery.get(p.table)) {
-    h.db.exec(`DROP TABLE ${JSON.stringify(p.table)}`);
+    h.db.exec(`DROP TABLE ${tableIdent}`);
   }
 
   const nullTokens = new Set([...(p.null_tokens ?? ["", "NULL", "null", "\\N"])]);
@@ -288,16 +480,16 @@ function importCsv(h: Handle, p: {
 
   const existsAfter = tableExistsQuery.get(p.table) !== undefined;
   if ((p.create_table !== false) && !existsAfter) {
-    const cols = columns.map((c, i) => `${JSON.stringify(c)} ${types[i]}`).join(", ");
-    h.db.exec(`CREATE TABLE ${JSON.stringify(p.table)} (${cols})`);
+    const cols = columns.map((_, i) => `${colIdents[i]} ${types[i]}`).join(", ");
+    h.db.exec(`CREATE TABLE ${tableIdent} (${cols})`);
   }
 
-  const stmt = h.db.prepare(`INSERT INTO ${JSON.stringify(p.table)} (${columns.map((c) => JSON.stringify(c)).join(",")}) VALUES (${columns.map(() => "?").join(",")})`);
+  const stmt = h.db.prepare(`INSERT INTO ${tableIdent} (${colIdents.join(",")}) VALUES (${columns.map(() => "?").join(",")})`);
   const tx = h.db.transaction((batch: unknown[][]) => {
     for (const row of batch) {
       const values = row.map((v, i) => {
         if (v == null || nullTokens.has(String(v))) return null;
-        return coerceCell(String(v), types[i]);
+        return coerceCell(String(v), types[i]!);
       });
       stmt.run(values);
     }
@@ -327,7 +519,7 @@ function exportCsv(h: Handle, p: {
 }) {
   const stmt = h.db.prepare(p.sql);
   const rows = (p.params !== undefined ? stmt.all(p.params as any) : stmt.all()) as any[];
-  const abs = resolve(p.output_path);
+  const abs = resolveSafePath(p.output_path, "export_csv.output_path"); // S1
   const cols = stmt.columns().map((c) => c.name);
   const data = rows.map((r) => cols.map((c) => r[c]));
   const csv = stringifyCsv(data, {
@@ -348,7 +540,7 @@ function exportJson(h: Handle, p: {
 }) {
   const stmt = h.db.prepare(p.sql);
   const rows = (p.params !== undefined ? stmt.all(p.params as any) : stmt.all()) as any[];
-  const abs = resolve(p.output_path);
+  const abs = resolveSafePath(p.output_path, "export_json.output_path"); // S1
   let content: string;
   if (p.ndjson) {
     content = rows.map((r) => JSON.stringify(r)).join("\n") + "\n";
@@ -360,7 +552,7 @@ function exportJson(h: Handle, p: {
 }
 
 function backup(h: Handle, destPath: string) {
-  const abs = resolve(destPath);
+  const abs = resolveSafePath(destPath, "backup.dest_path"); // S1
   return h.db.backup(abs).then((progress: any) => ({
     path: abs,
     total_pages: progress.totalPages,
