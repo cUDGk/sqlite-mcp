@@ -24,10 +24,10 @@
 
 | アクション | 用途 |
 |---|---|
-| `open` / `close` / `list_open` | DB ライフサイクル。`readonly` / `create` / `pragmas[]` 指定可 |
+| `open` / `close` / `list_open` | DB ライフサイクル。`readonly` / `create` / `pragmas[]` 指定可。`readonly: true` は対象ファイルが既に存在している必要がある（無ければ ENOENT エラー） |
 | `query` | prepared SELECT。`params` は配列（`?`）またはオブジェクト（`@name` / `:name` / `$name`）。行数 + カラム型情報 |
 | `execute` | 単一 prepared DML/DDL。`changes` / `last_insert_rowid` を返す |
-| `execute_script` | 複数文スクリプト（`;` 区切り）。params 不可、戻り値なし |
+| `execute_script` | 複数文スクリプト（`;` 区切り）。params 不可、`{ok: true}` を返す |
 | `transaction` | `statements[]` を atomic に実行 |
 | `schema` | 全オブジェクト列挙。`table` 指定で columns / FKs / indexes |
 | `pragma` | `PRAGMA ...` 直叩き |
@@ -36,8 +36,9 @@
 | `vacuum` | `VACUUM`、`dest_path` 指定で `VACUUM INTO` に切替 |
 | `attach` / `detach` | `ATTACH DATABASE ... AS <schema_name>` / `DETACH` のラッパー |
 | `list_schemas` | `pragma_database_list` を返却 (`main` / `temp` / attached 一覧) |
-| `import_csv` | CSV を指定テーブルにインポート。型推論 (INTEGER/REAL/TEXT)、`has_header` / `delimiter` / `null_tokens` / `create_table` / `replace_table` / `batch_size` 対応 |
-| `export_csv` / `export_json` | query 結果を `output_path` に書き出し。JSON は `pretty` / `ndjson` 切替 |
+| `import_csv` | CSV を指定テーブルにインポート。型推論 (INTEGER/REAL/TEXT)、`has_header` / `delimiter` / `null_tokens` (既定 `["", "NULL", "null", "\\N"]`) / `create_table` / `replace_table` / `batch_size` 対応。**全体を 1 トランザクションで実行**するので途中失敗時は完全ロールバック |
+| `export_csv` / `export_json` | query 結果を `output_path` に書き出し。JSON は `pretty` / `ndjson` 切替（`ndjson` は `stmt.iterate()` でストリーム書き込み） |
+| `dump_sql` | `sqlite_master` から `CREATE …` 文を全部集めてスキーマダンプを返す。**自動生成インデックス**（`PRIMARY KEY` / `UNIQUE` 等）は `sqlite_master.sql` が `NULL` のため除外されるが、`CREATE TABLE` 文を再実行すれば暗黙に再作成される |
 
 ## インストール
 
@@ -51,7 +52,7 @@ cd sqlite-mcp && npm install && npm run build
 ## 使い方
 
 ```bash
-claude mcp add sqlite -- node C:/Users/user/Desktop/sqlite-mcp/dist/index.js
+claude mcp add sqlite -- node /path/to/sqlite-mcp/dist/index.js
 ```
 
 ### 環境変数
@@ -59,6 +60,9 @@ claude mcp add sqlite -- node C:/Users/user/Desktop/sqlite-mcp/dist/index.js
 | 変数 | デフォルト | 用途 |
 |---|---|---|
 | `SQLITE_MAX_ROWS` | `1000` | `query` のデフォルト行数上限 |
+| `SQLITE_MAX_LIMIT` | `100000` | `query` の `limit` 引数の上限 (これより大きい値はエラー) |
+| `SQLITE_ALLOWED_ROOT` | サーバの CWD | `open` / `attach` / `import_csv` / `export_csv` / `export_json` / `vacuum INTO` / `backup` の対象パスを `path.resolve` + `path.relative` ベースで閉じ込める。文字列 startsWith ではないので `..` での脱出不可 |
+| `SQLITE_ALLOW_DANGEROUS` | (未設定) | `1` を設定すると、PRAGMA allowlist 外の `pragma` 実行と、`execute_script` 内の `ATTACH DATABASE` / `PRAGMA writable_schema` の実行が許可される。ただし `writable_schema` / `temp_store_directory` / `data_store_directory` は常時ブロック |
 
 ### 呼び出し例
 
@@ -133,7 +137,10 @@ EXPLAIN QUERY PLAN で index 効いてるか確認:
 
 - **同期 API** — `better-sqlite3` は同期クライアントなので await なしで高速（MCP 経由でも 1 回の tool call で 1 往復）
 - **`readonly: true` で安全化** — LLM に勝手に DDL/DML させたくない時に
-- **prepared statement に強制** — `execute` は常に `.prepare()`、SQL インジェクション面で安全（文字列連結でクエリを作らせない）
+- **prepared statement** — `query` / `execute` / `transaction` は常に `.prepare()` + bind param。**ただし** `sql` 本文は LLM が書く文字列なので、bind されない箇所での injection 自体は防げない。`SQLITE_ALLOWED_ROOT` / PRAGMA allowlist / 識別子バリデーションで多層に絞っている前提
+- **トランザクションは atomic 限定** — `transaction` アクションは `statements[]` を 1 ターン内で atomic 実行する。MCP ターンをまたいで `BEGIN ... COMMIT` を分割する手動制御は出来ない（接続が同じ better-sqlite3 ハンドルなのでターンをまたぐと状態が壊れやすい為）
+- **`execute_script` の戻り値** — `{ ok: true }` のみ。ROW を返したい場合は分けて `query` を呼ぶ
+- **import_csv は atomic** — DROP / CREATE / INSERT 全部を 1 つの transaction でラップ。途中の型エラー等で全部巻き戻る
 
 ## Attribution
 
@@ -144,6 +151,18 @@ EXPLAIN QUERY PLAN で index 効いてるか確認:
 ## ライセンス
 
 MIT License © 2026 cUDGk — 詳細は [LICENSE](LICENSE) を参照。
+
+## Changelog
+
+## v0.3.0 — security & robustness
+
+- **FS confinement** — `open` / `attach` / `import_csv` / `export_csv` / `export_json` / `vacuum INTO` / `backup` の path は `SQLITE_ALLOWED_ROOT` 配下に強制。`path.resolve` + `path.relative` 判定なので `..` でも抜け出せない。未設定時の既定はサーバ CWD
+- **識別子バリデーション** — `schema(table=...)` / `import_csv` / `attach` / `detach` 等で組み立てる識別子は全て `quoteIdent()`（`/^[A-Za-z_][A-Za-z0-9_$]*$/` + `"` ダブル化）を通す。`PRAGMA table_info` 系は `pragma_table_info(?)` テーブル関数 + bind param に切替
+- **PRAGMA allowlist** — 読み取り中心の安全な PRAGMA のみ既定許可。`writable_schema` / `temp_store_directory` / `data_store_directory` は常時ブロック。それ以外を実行したい場合は `SQLITE_ALLOW_DANGEROUS=1`
+- **`execute_script` のガード** — 既定では `ATTACH DATABASE` / `PRAGMA writable_schema` を含むスクリプトを拒否（コメント除去後に走査）
+- **行数ハードキャップ** — `query` の `limit` は既定 `SQLITE_MAX_LIMIT=100000` で上限。さらに `stmt.iterate()` を使い `limit + 1` で打ち切るので大きい結果セットでも OOM しない
+- **その他** — `busy_timeout=5000` / `max_recursion_depth=1000` を毎オープン時に設定。SQLite エラーには `err.code` を含めて返す。SIGINT / SIGTERM で全 DB を確実にクローズ。`server.version` を `package.json` から取得
+- **新アクション** — `dump_sql`：`sqlite_master` の `sql` を全部集めてスキーマダンプ用に返す
 
 ## v0.2.1 修正
 

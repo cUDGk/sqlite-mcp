@@ -899,50 +899,67 @@ Actions:
 - open: open/create a DB at 'path'. Options: readonly (default false), create (default true), pragmas[] (applied on open, e.g. ["journal_mode = WAL", "foreign_keys = ON"]).
 - close: close the named DB.
 - list_open: enumerate all open DBs.
-- query: prepared SELECT (returns rows + column metadata). Rows truncated at 'limit' (default SQLITE_MAX_ROWS=1000).
-- execute: single prepared DML/DDL statement (INSERT/UPDATE/DELETE/CREATE ...). Returns changes + last_insert_rowid.
-- execute_script: multi-statement script (CREATE TABLE ...; INSERT ...; ...). No params, no row returns.
-- transaction: run multiple prepared statements atomically.
-- schema: list all objects (tables/views/indexes/triggers). Pass 'table' to get columns/FKs/indexes for a specific table.
-- pragma: run a PRAGMA query. e.g. "journal_mode", "foreign_keys", "table_list".
-- backup: online backup to 'dest_path'.
-- dump_sql: return CREATE / CREATE INDEX / etc. for full schema export.
+- list_schemas: list main / temp / attached schemas (pragma_database_list).
+- query: prepared SELECT (returns rows + column metadata). Rows truncated at 'limit' (default SQLITE_MAX_ROWS=1000, hard cap SQLITE_MAX_LIMIT).
+- execute: single prepared DML/DDL statement. Returns changes + last_insert_rowid.
+- execute_script: multi-statement script. No params, returns {ok: true}. ATTACH DATABASE and blocked PRAGMAs (writable_schema / temp_store_directory / data_store_directory) rejected unless SQLITE_ALLOW_DANGEROUS=1.
+- transaction: run multiple prepared statements atomically (single MCP turn — no manual BEGIN / COMMIT split across turns).
+- schema: list all objects. Pass 'table' to get columns / FKs / indexes for a specific table.
+- explain: return EXPLAIN QUERY PLAN (structured + tree string).
+- vacuum: VACUUM, or VACUUM INTO 'dest_path' (path confined to SQLITE_ALLOWED_ROOT).
+- attach / detach: attach/detach a sibling DB as 'schema_name' (file confined to SQLITE_ALLOWED_ROOT).
+- import_csv: bulk import from CSV. Auto type-inference (INTEGER / REAL / TEXT). Whole import is atomic.
+- export_csv / export_json: write a query result to disk. JSON supports pretty / ndjson (ndjson streams).
+- pragma: run a PRAGMA. Default-allowlist active; set SQLITE_ALLOW_DANGEROUS=1 to bypass (writable_schema is always blocked).
+- backup: online backup to 'dest_path' (path confined to SQLITE_ALLOWED_ROOT).
+- dump_sql: return CREATE / CREATE INDEX / etc. for full schema export. Auto-created indexes (PRIMARY KEY / UNIQUE / rowid) are excluded — CREATE TABLE re-creates them implicitly when the dump is replayed.
 
-params may be an array (positional ?) or object (named @name / :name / $name).`,
+params may be an array (positional ?) or object (named @name / :name / $name). Object/array arguments may also be passed as JSON strings.`,
   {
-    action: z.enum([
-      "open", "close", "list_open", "list_schemas",
-      "query", "execute", "execute_script", "transaction",
-      "schema", "pragma", "backup",
-      "explain", "vacuum", "attach", "detach",
-      "import_csv", "export_csv", "export_json",
-      "dump_sql",
-    ]).describe("Action"),
+    action: (() => {
+      const vals = [
+        "open", "close", "list_open", "list_schemas",
+        "query", "execute", "execute_script", "transaction",
+        "schema", "pragma", "backup",
+        "explain", "vacuum", "attach", "detach",
+        "import_csv", "export_csv", "export_json",
+        "dump_sql",
+      ] as const;
+      return z.enum(vals).describe(vals.join(" | "));
+    })(),
     name: z.string().optional().describe("DB handle name (default 'default')"),
-    path: z.string().optional().describe("open/import_csv: file path"),
-    readonly: z.boolean().optional().describe("open: open as readonly"),
-    create: z.boolean().optional().describe("open: allow create if missing (default true)"),
-    pragmas: z.union([z.array(z.string()), z.string()]).optional().describe("open: PRAGMAs to apply on open"),
-    sql: z.string().optional().describe("query/execute/execute_script/explain/export_*: SQL text"),
-    params: z.any().optional().describe("query/execute/explain/export_*: positional array or named object"),
-    limit: z.number().int().positive().optional().describe("query: row cap (default 1000)"),
-    table: z.string().optional().describe("schema/import_csv: table name"),
-    pragma: z.string().optional().describe("pragma: pragma expression"),
-    statements: z.union([z.array(z.object({ sql: z.string(), params: z.any().optional() })), z.string()]).optional().describe("transaction: list of prepared statements"),
-    dest_path: z.string().optional().describe("backup/vacuum(INTO): destination path"),
-    schema_name: z.string().optional().describe("attach/detach: schema alias"),
+    path: z.string().optional().describe("open / import_csv / attach: file path (confined to SQLITE_ALLOWED_ROOT)"),
+    // U7: note the default explicitly.
+    readonly: z.boolean().optional().describe("open: open as readonly (default false). When true, the file must already exist."),
+    // U1/U8: clarify what `create` actually controls; note readonly also implies fileMustExist.
+    create: z.boolean().optional().describe("open: when missing, create a new DB file (default true). Set false to require the file to already exist. Note: readonly:true also implies fileMustExist."),
+    pragmas: z.union([z.array(z.string()), z.string()]).optional().describe("open: PRAGMAs to apply on open. Accepts a JSON-stringified array."),
+    sql: z.string().optional().describe("query / execute / execute_script / explain / export_*: SQL text"),
+    params: z.any().optional().describe("query / execute / explain / export_*: positional array or named object. JSON-string accepted."),
+    // S5: .finite() rejects Infinity / NaN that pass through z.number().int() in some pipelines.
+    limit: z.number().int().positive().finite().optional().describe(`query: row cap (default ${MAX_ROWS}, max ${MAX_LIMIT})`),
+    table: z.string().optional().describe("schema / import_csv: table name (must be a valid SQL identifier)"),
+    pragma: z.string().optional().describe("pragma: pragma expression. e.g. 'journal_mode' or 'cache_size = -2000'."),
+    statements: z
+      .union([z.array(z.object({ sql: z.string(), params: z.any().optional() })), z.string()])
+      .optional()
+      .describe("transaction: list of prepared statements. JSON-string accepted."),
+    dest_path: z.string().optional().describe("backup / vacuum(INTO): destination path (confined to SQLITE_ALLOWED_ROOT)"),
+    schema_name: z.string().optional().describe("attach / detach: schema alias (matches /^[A-Za-z_][A-Za-z0-9_]{0,62}$/)"),
     // csv i/o
-    delimiter: z.string().optional().describe("import_csv/export_csv: field delimiter (default ',')"),
+    delimiter: z.string().optional().describe("import_csv / export_csv: field delimiter (default ',')"),
     has_header: z.boolean().optional().describe("import_csv: first row is header (default true)"),
     header: z.boolean().optional().describe("export_csv: write header row (default true)"),
     create_table: z.boolean().optional().describe("import_csv: auto-CREATE if missing (default true)"),
     replace_table: z.boolean().optional().describe("import_csv: DROP + recreate if exists"),
-    columns: z.union([z.array(z.string()), z.string()]).optional().describe("import_csv: explicit column names"),
-    batch_size: z.number().int().positive().optional().describe("import_csv: rows per transaction (default 1000)"),
-    null_tokens: z.union([z.array(z.string()), z.string()]).optional().describe("import_csv: strings treated as NULL (default ['', 'NULL', 'null', '\\\\N'])"),
-    output_path: z.string().optional().describe("export_csv/export_json: destination path"),
+    columns: z.union([z.array(z.string()), z.string()]).optional().describe("import_csv: explicit column names. JSON-string accepted."),
+    // U1: actually implemented now via multi-VALUES INSERT. Whole import remains
+    // atomic because the outer transaction wraps everything.
+    batch_size: z.number().int().positive().finite().optional().describe("import_csv: rows bound per multi-VALUES INSERT (default 1, capped at 1000). Whole import is still atomic."),
+    null_tokens: z.union([z.array(z.string()), z.string()]).optional().describe('import_csv: strings treated as NULL (default ["", "NULL", "null", "\\N"]). JSON-string accepted.'),
+    output_path: z.string().optional().describe("export_csv / export_json: destination path (confined to SQLITE_ALLOWED_ROOT)"),
     pretty: z.boolean().optional().describe("export_json: pretty-print"),
-    ndjson: z.boolean().optional().describe("export_json: one-object-per-line"),
+    ndjson: z.boolean().optional().describe("export_json: one-object-per-line (streamed)"),
   },
   async (p) => {
     try {
@@ -983,7 +1000,11 @@ params may be an array (positional ?) or object (named @name / :name / $name).`,
         case "schema":
           return textContent(getSchema(getHandle(p.name), p.table));
         case "pragma": {
-          if (!p.pragma) return errContent("pragma requires 'pragma'");
+          if (!p.pragma) {
+            return errContent(
+              `pragma requires 'pragma' (e.g. {"action":"pragma","pragma":"journal_mode"} or "cache_size = -2000")`,
+            );
+          }
           return textContent(runPragma(getHandle(p.name), p.pragma));
         }
         case "backup": {
@@ -1035,11 +1056,15 @@ params may be an array (positional ?) or object (named @name / :name / $name).`,
         }
         case "dump_sql":
           return textContent(runDumpSql(getHandle(p.name)));
+        default: {
+          // U4: exhaustiveness check.
+          const _exh: never = p.action;
+          return errContent(`unknown action: ${String(_exh)}`);
+        }
       }
     } catch (err) {
       return errContent(formatError(err));
     }
-    return errContent("unreachable");
   },
 );
 
