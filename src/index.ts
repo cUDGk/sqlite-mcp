@@ -3,8 +3,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import Database from "better-sqlite3";
-import { existsSync, readFileSync, statSync, writeFileSync, realpathSync } from "node:fs";
+import { createWriteStream, readFileSync, statSync, realpathSync } from "node:fs";
 import { resolve, relative, isAbsolute, dirname, basename } from "node:path";
+import { createRequire } from "node:module";
 import { parse as parseCsv } from "csv-parse/sync";
 import { stringify as stringifyCsv } from "csv-stringify/sync";
 
@@ -18,7 +19,30 @@ type Handle = {
 
 const registry = new Map<string, Handle>();
 const DEFAULT_NAME = "default";
-const MAX_ROWS = parseInt(process.env.SQLITE_MAX_ROWS ?? "1000", 10);
+
+// B7: track in-flight async ops (export_csv / export_json / backup) so shutdown
+// can wait for them to drain before closing DB handles.
+let inflightAsync = 0;
+async function trackAsync<T>(fn: () => Promise<T>): Promise<T> {
+  inflightAsync++;
+  try {
+    return await fn();
+  } finally {
+    inflightAsync--;
+  }
+}
+
+// B1: Guard NaN/negative on env-var parses.
+function parseIntSafe(s: string | undefined, fallback: number): number {
+  if (s === undefined) return fallback;
+  const n = parseInt(s, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+// S4: hard cap; configurable via env, default 100000.
+const MAX_LIMIT = parseIntSafe(process.env.SQLITE_MAX_LIMIT, 100_000);
+// B4: clamp MAX_ROWS to MAX_LIMIT so MAX_ROWS > MAX_LIMIT is impossible.
+const MAX_ROWS = Math.min(parseIntSafe(process.env.SQLITE_MAX_ROWS, 1000), MAX_LIMIT);
 const ALLOW_DANGEROUS = process.env.SQLITE_ALLOW_DANGEROUS === "1";
 
 // S1: confine FS-touching paths to a root. Default: server CWD.
@@ -32,6 +56,17 @@ const ALLOWED_ROOT = (() => {
     throw e;
   }
 })();
+
+// Read package version once for server identity (B10).
+const pkgRequire = createRequire(import.meta.url);
+let PKG_VERSION = "0.0.0";
+try {
+  PKG_VERSION = (pkgRequire("../package.json") as { version?: string }).version ?? "0.0.0";
+} catch {
+  try {
+    PKG_VERSION = (pkgRequire("../../package.json") as { version?: string }).version ?? "0.0.0";
+  } catch {}
+}
 
 // S1 helper: resolve the deepest existing ancestor so symlinks in any prefix
 // of a non-existent write path are still caught.
@@ -186,6 +221,32 @@ function ensureScriptSafe(sql: string): void {
   }
 }
 
+// C1: bind dispatch helpers. better-sqlite3's stmt.run/all/get/iterate take
+// EITHER spread positional args (array → ...spread) OR a single named-bind
+// object (Record<string, unknown> → pass as one arg). Passing the array
+// without spread silently fails for named binds. Centralize the dispatch.
+type BindParams = unknown[] | Record<string, unknown> | undefined;
+function callRun(stmt: Database.Statement, params: BindParams): Database.RunResult {
+  if (params === undefined) return stmt.run();
+  if (Array.isArray(params)) return stmt.run(...params);
+  return stmt.run(params);
+}
+function callAll(stmt: Database.Statement, params: BindParams): unknown[] {
+  if (params === undefined) return stmt.all();
+  if (Array.isArray(params)) return stmt.all(...params);
+  return stmt.all(params);
+}
+function callGet(stmt: Database.Statement, params: BindParams): unknown {
+  if (params === undefined) return stmt.get();
+  if (Array.isArray(params)) return stmt.get(...params);
+  return stmt.get(params);
+}
+function callIterate(stmt: Database.Statement, params: BindParams): IterableIterator<unknown> {
+  if (params === undefined) return stmt.iterate() as IterableIterator<unknown>;
+  if (Array.isArray(params)) return stmt.iterate(...params) as IterableIterator<unknown>;
+  return stmt.iterate(params) as IterableIterator<unknown>;
+}
+
 // Some LLM tool-call paths deliver object/array arguments as JSON strings.
 // Parse those back into structured values before use.
 function coerceObject<T>(v: unknown): T | undefined {
@@ -195,8 +256,8 @@ function coerceObject<T>(v: unknown): T | undefined {
     if (s === "") return undefined;
     try {
       return JSON.parse(s) as T;
-    } catch (e: any) {
-      throw new Error(`failed to parse JSON string argument: ${e.message}`);
+    } catch (e) {
+      throw new Error(`failed to parse JSON string argument: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
   return v as T;
@@ -205,8 +266,41 @@ function coerceObject<T>(v: unknown): T | undefined {
 function getHandle(name?: string): Handle {
   const n = name ?? DEFAULT_NAME;
   const h = registry.get(n);
-  if (!h) throw new Error(`no db open for name="${n}". Call action=open first.`);
+  if (!h) {
+    // U10: nicer message when caller never specified a name.
+    if (name === undefined) {
+      throw new Error(`default db not open. Call action=open first.`);
+    }
+    throw new Error(`no db open for name="${n}". Call action=open first.`);
+  }
   return h;
+}
+
+// B8: serialize values that JSON.stringify can't represent natively.
+// Buffer (BLOB) → { $blob: <base64> } so callers can round-trip back.
+function serializeValue(v: unknown): unknown {
+  if (v === null || v === undefined) return v;
+  if (Buffer.isBuffer(v)) return { $blob: v.toString("base64") };
+  if (typeof v === "bigint") return Number(v);
+  return v;
+}
+function serializeRow(row: unknown): unknown {
+  if (row === null || row === undefined) return row;
+  if (Array.isArray(row)) return row.map(serializeValue);
+  if (Buffer.isBuffer(row)) return serializeValue(row);
+  if (typeof row === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(row as Record<string, unknown>)) {
+      out[k] = serializeValue(v);
+    }
+    return out;
+  }
+  return row;
+}
+// CSV needs a string-shaped repr (no nested object).
+function blobToCsvCell(v: unknown): unknown {
+  if (Buffer.isBuffer(v)) return `data:application/octet-stream;base64,${v.toString("base64")}`;
+  return v;
 }
 
 function openDb(p: {
@@ -224,11 +318,13 @@ function openDb(p: {
   }
   const abs = resolveSafePath(p.path, "open.path");
   const readonly = p.readonly === true;
-  const exists = existsSync(abs);
-  if (!exists && p.create === false) {
-    throw new Error(`file not found: ${abs} (create=false)`);
-  }
-  const db = new Database(abs, { readonly, fileMustExist: p.create === false });
+  // B7: drop existsSync precheck — better-sqlite3's fileMustExist handles it atomically.
+  // C2: readonly mode implies the file must exist; SQLite would otherwise create a
+  // 0-byte unusable read-only handle.
+  const db = new Database(abs, {
+    readonly,
+    fileMustExist: p.create === false || readonly === true,
+  });
 
   // S6: every opened DB gets sane busy/recursion settings.
   try { db.pragma("busy_timeout = 5000"); } catch {}
@@ -239,6 +335,7 @@ function openDb(p: {
       ensurePragmaAllowed(pr);
       db.pragma(pr);
     } catch (e: unknown) {
+      // U5: narrow `unknown` properly instead of `any`.
       try { db.close(); } catch {}
       const msg = e instanceof Error ? e.message : String(e);
       throw new Error(`invalid pragma "${pr}": ${msg}`);
@@ -249,34 +346,95 @@ function openDb(p: {
   return h;
 }
 
-function closeDb(name?: string) {
+function closeDb(name?: string): { ok: true; closed: true; name: string } {
   const n = name ?? DEFAULT_NAME;
   const h = registry.get(n);
-  if (!h) return { closed: false, name: n, reason: "not open" };
+  // U2: if no such handle, the caller should be told via errContent — caller checks
+  // for `null` and converts to errContent. Don't silently report success.
+  if (!h) {
+    throw new Error(`no db open for name="${n}"`);
+  }
   try { h.db.close(); } catch {}
   registry.delete(n);
-  return { closed: true, name: n };
+  return { ok: true, closed: true, name: n };
+}
+
+function closeAllDbs() {
+  for (const [n, h] of [...registry]) {
+    try { h.db.close(); } catch {}
+    registry.delete(n);
+  }
 }
 
 function runQuery(h: Handle, sql: string, params?: unknown[] | Record<string, unknown>, limit?: number) {
+  // S4: cap limit.
+  const requested = limit ?? MAX_ROWS;
+  if (requested > MAX_LIMIT) {
+    throw new Error(`limit ${requested} exceeds SQLITE_MAX_LIMIT=${MAX_LIMIT}`);
+  }
+  const lim = requested;
   const stmt = h.db.prepare(sql);
-  const lim = limit ?? MAX_ROWS;
-  const rows = params !== undefined ? stmt.all(params as any) : stmt.all();
-  const truncated = rows.length > lim;
-  const kept = truncated ? rows.slice(0, lim) : rows;
+
+  // B2: stmt.columns() throws on non-SELECT; only call for readers.
+  let columns: Array<{ name: string; type: string | null; column: string | null; table: string | null }> = [];
+  if (stmt.reader) {
+    try {
+      columns = stmt.columns().map((c) => ({ name: c.name, type: c.type, column: c.column, table: c.table }));
+    } catch {
+      columns = [];
+    }
+  }
+
+  // S5: stream rows up to lim+1 to detect truncation without loading everything.
+  // C1: callIterate handles named-bind objects correctly.
+  // B1: drop manual iter.return(); for-of's auto-close handles it.
+  // B8: serialize BLOBs/bigints in each row.
+  const kept: unknown[] = [];
+  let truncated = false;
+  if (stmt.reader) {
+    const iter = callIterate(stmt, params);
+    try {
+      for (const row of iter) {
+        if (kept.length >= lim) {
+          truncated = true;
+          break;
+        }
+        kept.push(serializeRow(row));
+      }
+    } finally {
+      try { iter.return?.(); } catch {}
+    }
+  } else {
+    // Non-SELECT prepared with .prepare() — fall back to .all() which returns [].
+    const rows = callAll(stmt, params);
+    for (const r of rows.slice(0, lim)) kept.push(serializeRow(r));
+  }
+
   return {
-    row_count: rows.length,
+    row_count: kept.length,
     rows: kept,
     truncated,
     limit: lim,
-    columns: stmt.columns().map((c) => ({ name: c.name, type: c.type, column: c.column, table: c.table })),
+    columns,
   };
 }
 
 function runExec(h: Handle, sql: string, params?: unknown[] | Record<string, unknown>) {
   if (h.readonly) throw new Error(`db "${h.name}" is readonly`);
-  const stmt = h.db.prepare(sql);
-  const info = params !== undefined ? stmt.run(params as any) : stmt.run();
+  let stmt: Database.Statement;
+  try {
+    stmt = h.db.prepare(sql);
+  } catch (e) {
+    // B3: friendlier hint for the common "more than one statement" footgun.
+    if (e instanceof Error && /more than one statement/i.test(e.message)) {
+      throw new Error(
+        `${e.message}. Hint: action=execute runs a single prepared statement; use action=execute_script for multi-statement scripts.`,
+      );
+    }
+    throw e;
+  }
+  // C1: callRun handles named-bind objects correctly.
+  const info = callRun(stmt, params);
   return {
     changes: info.changes,
     last_insert_rowid: Number(info.lastInsertRowid),
@@ -293,21 +451,18 @@ function runExecScript(h: Handle, sql: string) {
 function runTransaction(h: Handle, statements: Array<{ sql: string; params?: unknown }>) {
   if (h.readonly) throw new Error(`db "${h.name}" is readonly`);
   const tx = h.db.transaction((items: typeof statements) => {
-    const results: any[] = [];
+    const results: Database.RunResult[] = [];
     for (const it of items) {
       const stmt = h.db.prepare(it.sql);
-      if (it.params !== undefined) {
-        results.push(stmt.run(it.params as any));
-      } else {
-        results.push(stmt.run());
-      }
+      // C1: callRun handles named-bind objects correctly.
+      results.push(callRun(stmt, it.params as BindParams));
     }
     return results;
   });
   const raw = tx(statements);
   return {
     count: raw.length,
-    results: raw.map((r: any) => ({ changes: r.changes, last_insert_rowid: Number(r.lastInsertRowid) })),
+    results: raw.map((r) => ({ changes: r.changes, last_insert_rowid: Number(r.lastInsertRowid) })),
   };
 }
 
@@ -324,6 +479,23 @@ function getSchema(h: Handle, table?: string) {
   return { objects };
 }
 
+function runDumpSql(h: Handle) {
+  // U10: full schema export.
+  // B3: sqlite_master.sql is NULL for auto-created indexes (PRIMARY KEY,
+  // UNIQUE constraints, INTEGER PRIMARY KEY rowid mapping). Re-running the
+  // emitted CREATE TABLE statements re-creates those auto-indexes implicitly,
+  // so excluding NULL-sql rows here is correct. Documented in the action
+  // description and README.
+  const rows = h.db
+    .prepare(`SELECT type, name, tbl_name, sql FROM sqlite_master WHERE sql IS NOT NULL
+             UNION ALL
+             SELECT type, name, tbl_name, sql FROM sqlite_temp_master WHERE sql IS NOT NULL
+             ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 WHEN 'view' THEN 3 WHEN 'trigger' THEN 4 ELSE 5 END, name`)
+    .all() as Array<{ type: string; name: string; tbl_name: string | null; sql: string }>;
+  const dump = rows.map((r) => `${r.sql};`).join("\n\n");
+  return { count: rows.length, objects: rows, sql: dump };
+}
+
 function runPragma(h: Handle, pragma: string) {
   ensurePragmaAllowed(pragma); // S3 + S8
   const out = h.db.pragma(pragma);
@@ -333,24 +505,43 @@ function runPragma(h: Handle, pragma: string) {
 function listOpen() {
   return {
     count: registry.size,
-    open: Array.from(registry.values()).map((h) => ({
-      name: h.name,
-      path: h.path,
-      readonly: h.readonly,
-      file_size: existsSync(h.path) ? statSync(h.path).size : null,
-      opened_at_ms_ago: Date.now() - h.opened_at,
-    })),
+    open: Array.from(registry.values()).map((h) => {
+      let file_size: number | null = null;
+      try { file_size = statSync(h.path).size; } catch { /* deleted or inaccessible */ }
+      return {
+        name: h.name,
+        path: h.path,
+        readonly: h.readonly,
+        file_size,
+        opened_at_ms_ago: Date.now() - h.opened_at,
+      };
+    }),
   };
 }
 
 function runExplain(h: Handle, sql: string, params?: unknown[] | Record<string, unknown>) {
   const wrapped = `EXPLAIN QUERY PLAN ${sql}`;
   const stmt = h.db.prepare(wrapped);
-  const rows = (params !== undefined ? stmt.all(params as any) : stmt.all()) as Array<{ id: number; parent: number; notused: number; detail: string }>;
-  const lines = rows.map((r) => {
-    const indent = "  ".repeat(Math.max(0, r.parent ? 1 : 0));
-    return `${indent}${r.detail}`;
-  });
+  // C1: callAll handles named-bind objects correctly.
+  const rows = callAll(stmt, params) as Array<{ id: number; parent: number; notused: number; detail: string }>;
+  // U6: walk parent chain so nested subplans render at their true depth instead
+  // of always being indented by one when parent != 0.
+  const byId = new Map<number, { id: number; parent: number; detail: string }>();
+  for (const r of rows) byId.set(r.id, r);
+  const depthOf = (r: { parent: number }): number => {
+    let d = 0;
+    let cur: { parent: number } | undefined = r;
+    const seen = new Set<number>();
+    while (cur && cur.parent && !seen.has(cur.parent)) {
+      seen.add(cur.parent);
+      const p = byId.get(cur.parent);
+      if (!p) break;
+      d++;
+      cur = p;
+    }
+    return d;
+  };
+  const lines = rows.map((r) => `${"  ".repeat(depthOf(r))}${r.detail}`);
   return { sql, plan: rows, tree: lines.join("\n") };
 }
 
@@ -359,6 +550,8 @@ function runVacuum(h: Handle, intoPath?: string) {
   if (intoPath !== undefined) {
     // S7: sanitize + root-confine the destination.
     const abs = resolveSafePath(intoPath, "vacuum.dest_path");
+    // U2: SQLite limitation: VACUUM INTO does not accept ? bind parameters; path is
+    // single-quote escaped after resolveSafePath validation.
     h.db.exec(`VACUUM INTO '${abs.replace(/'/g, "''")}'`);
     return { ok: true, into: abs };
   }
@@ -394,21 +587,25 @@ function runListSchemas(h: Handle) {
 }
 
 function inferColumnType(samples: unknown[]): "INTEGER" | "REAL" | "TEXT" {
-  let sawNumber = false;
+  // B2: only treat values as REAL when they actually contain `.` or an exponent.
+  // Plain digit-only strings stay INTEGER even if very long; "1e5" → REAL.
   let sawFloat = false;
   let sawNonEmpty = false;
+  const intRe = /^-?\d+$/;
+  const floatRe = /^-?\d+(\.\d+)?([eE][+-]?\d+)?$/;
   for (const s of samples) {
     if (s === null || s === undefined || s === "") continue;
     sawNonEmpty = true;
     const str = String(s);
-    if (/^-?\d+$/.test(str)) {
-      sawNumber = true;
-    } else if (/^-?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(str)) {
-      sawNumber = true;
-      sawFloat = true;
-    } else {
-      return "TEXT";
+    if (intRe.test(str)) {
+      // pure integer
+      continue;
     }
+    if (floatRe.test(str)) {
+      sawFloat = true;
+      continue;
+    }
+    return "TEXT";
   }
   if (!sawNonEmpty) return "TEXT";
   return sawFloat ? "REAL" : "INTEGER";
@@ -440,14 +637,32 @@ function importCsv(h: Handle, p: {
 }) {
   if (h.readonly) throw new Error(`db "${h.name}" is readonly`);
   const abs = resolveSafePath(p.path, "import_csv.path"); // S1
-  const content = readFileSync(abs, "utf8");
+  // C3: detect UTF-16 BOM so CSV files exported from Excel/Windows aren't read
+  // as garbage UTF-8. Sniff the first two bytes; transcode to UTF-8 if needed.
+  const buf = readFileSync(abs);
+  let content: string;
+  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) {
+    // UTF-16 LE BOM
+    content = buf.slice(2).toString("utf16le");
+  } else if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) {
+    // UTF-16 BE BOM — node has no native utf16be decoder; swap byte pairs into LE.
+    const body = buf.slice(2);
+    const swapped = Buffer.alloc(body.length);
+    for (let i = 0; i + 1 < body.length; i += 2) {
+      swapped[i] = body[i + 1]!;
+      swapped[i + 1] = body[i]!;
+    }
+    content = swapped.toString("utf16le");
+  } else {
+    content = buf.toString("utf8");
+  }
   const records = parseCsv(content, {
     delimiter: p.delimiter ?? ",",
     columns: p.has_header !== false,
     skip_empty_lines: true,
     trim: false,
     bom: true,
-  }) as any[];
+  }) as unknown[];
   if (records.length === 0) return { imported: 0, table: p.table };
 
   // S2: validate table identifier upfront — quoteIdent throws on bad names.
@@ -456,21 +671,18 @@ function importCsv(h: Handle, p: {
   let columns: string[];
   let rows: unknown[][];
   if (p.has_header !== false) {
-    columns = p.columns ?? Object.keys(records[0]);
-    rows = records.map((r: any) => columns.map((c) => r[c]));
+    const firstRow = records[0] as Record<string, unknown> | undefined;
+    columns = p.columns ?? (firstRow ? Object.keys(firstRow) : []);
+    rows = (records as Record<string, unknown>[]).map((r) => columns.map((c) => r[c]));
   } else {
-    const width = (records[0] as any[]).length;
+    const firstRow = records[0] as unknown[] | undefined;
+    const width = firstRow ? firstRow.length : 0;
     columns = p.columns ?? Array.from({ length: width }, (_, i) => `col${i + 1}`);
-    rows = records as any[][];
+    rows = records as unknown[][];
   }
 
   // S2: each column name validated by quoteIdent.
   const colIdents = columns.map(quoteIdent);
-
-  const tableExistsQuery = h.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?");
-  if (p.replace_table && tableExistsQuery.get(p.table)) {
-    h.db.exec(`DROP TABLE ${tableIdent}`);
-  }
 
   const nullTokens = new Set([...(p.null_tokens ?? ["", "NULL", "null", "\\N"])]);
   const types: ("INTEGER" | "REAL" | "TEXT")[] = columns.map((_, ci) => {
@@ -478,30 +690,64 @@ function importCsv(h: Handle, p: {
     return inferColumnType(sample.filter((v) => !(v == null || nullTokens.has(String(v)))));
   });
 
-  const existsAfter = tableExistsQuery.get(p.table) !== undefined;
-  if ((p.create_table !== false) && !existsAfter) {
-    const cols = columns.map((_, i) => `${colIdents[i]} ${types[i]}`).join(", ");
-    h.db.exec(`CREATE TABLE ${tableIdent} (${cols})`);
-  }
-
-  const stmt = h.db.prepare(`INSERT INTO ${tableIdent} (${colIdents.join(",")}) VALUES (${columns.map(() => "?").join(",")})`);
-  const tx = h.db.transaction((batch: unknown[][]) => {
-    for (const row of batch) {
-      const values = row.map((v, i) => {
+  // B5: wrap the entire import — DROP / CREATE / INSERT — in one transaction so a
+  // mid-stream error rolls back the schema change too.
+  // U1: batch_size, when supplied, rebuilds the prepared INSERT statement to
+  // bind `batch_size` rows at a time (multi-VALUES insert). Whole import is
+  // still atomic because of the outer transaction.
+  // B4: tableExistsQuery is now prepared inside the transaction closure; safe
+  // single-threaded since better-sqlite3 serializes calls on one handle.
+  const batchSize = Math.max(1, Math.min(p.batch_size ?? 1, 1000));
+  let total = 0;
+  const importAll = h.db.transaction(() => {
+    const tableExistsQuery = h.db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+    );
+    if (p.replace_table && tableExistsQuery.get(p.table)) {
+      h.db.exec(`DROP TABLE ${tableIdent}`);
+    }
+    const existsAfter = tableExistsQuery.get(p.table) !== undefined;
+    if ((p.create_table !== false) && !existsAfter) {
+      const cols = columns.map((_, i) => `${colIdents[i]} ${types[i]}`).join(", ");
+      h.db.exec(`CREATE TABLE ${tableIdent} (${cols})`);
+    }
+    const placeholderRow = `(${columns.map(() => "?").join(",")})`;
+    const singleStmt = h.db.prepare(
+      `INSERT INTO ${tableIdent} (${colIdents.join(",")}) VALUES ${placeholderRow}`,
+    );
+    const coerceRow = (row: unknown[]): unknown[] =>
+      row.map((v, i) => {
         if (v == null || nullTokens.has(String(v))) return null;
-        return coerceCell(String(v), types[i]!);
+        const t = types[i] ?? "TEXT";
+        return coerceCell(String(v), t);
       });
-      stmt.run(values);
+
+    if (batchSize <= 1) {
+      for (const row of rows) {
+        singleStmt.run(...coerceRow(row));
+        total++;
+      }
+      return;
+    }
+    // multi-VALUES batched insert
+    const batchStmt = h.db.prepare(
+      `INSERT INTO ${tableIdent} (${colIdents.join(",")}) VALUES ${Array(batchSize).fill(placeholderRow).join(",")}`,
+    );
+    let i = 0;
+    while (i + batchSize <= rows.length) {
+      const flat: unknown[] = [];
+      for (let j = 0; j < batchSize; j++) flat.push(...coerceRow(rows[i + j] as unknown[]));
+      batchStmt.run(...flat);
+      total += batchSize;
+      i += batchSize;
+    }
+    for (; i < rows.length; i++) {
+      singleStmt.run(...coerceRow(rows[i] as unknown[]));
+      total++;
     }
   });
+  importAll();
 
-  const batchSize = p.batch_size ?? 1000;
-  let total = 0;
-  for (let i = 0; i < rows.length; i += batchSize) {
-    const batch = rows.slice(i, i + batchSize);
-    tx(batch);
-    total += batch.length;
-  }
   return {
     imported: total,
     table: p.table,
@@ -518,20 +764,36 @@ function exportCsv(h: Handle, p: {
   header?: boolean;
 }) {
   const stmt = h.db.prepare(p.sql);
-  const rows = (p.params !== undefined ? stmt.all(p.params as any) : stmt.all()) as any[];
   const abs = resolveSafePath(p.output_path, "export_csv.output_path"); // S1
-  const cols = stmt.columns().map((c) => c.name);
-  const data = rows.map((r) => cols.map((c) => r[c]));
+  const cols = stmt.reader ? stmt.columns().map((c) => c.name) : [];
+  // S4: iterate instead of materialising full result before applying MAX_LIMIT.
+  const iter = callIterate(stmt, p.params) as IterableIterator<Record<string, unknown>>;
+  const rows: Record<string, unknown>[] = [];
+  let truncated = false;
+  try {
+    for (const row of iter) {
+      if (rows.length >= MAX_LIMIT) { truncated = true; break; }
+      rows.push(row as Record<string, unknown>);
+    }
+  } finally {
+    try { iter.return?.(); } catch {}
+  }
+  // B8: encode BLOB cells as a string so csv-stringify produces a usable line.
+  const data = rows.map((r) => cols.map((c) => blobToCsvCell(r[c])));
   const csv = stringifyCsv(data, {
     delimiter: p.delimiter ?? ",",
     header: p.header !== false,
     columns: p.header !== false ? cols : undefined,
   });
-  writeFileSync(abs, csv, "utf8");
-  return { rows: rows.length, columns: cols, path: abs, bytes: Buffer.byteLength(csv, "utf8") };
+  const ws = createWriteStream(abs);
+  return new Promise<{ rows: number; columns: string[]; path: string; bytes: number; truncated: boolean }>((res, rej) => {
+    ws.on("error", rej);
+    ws.on("finish", () => res({ rows: rows.length, columns: cols, path: abs, bytes: Buffer.byteLength(csv, "utf8"), truncated }));
+    ws.end(csv);
+  });
 }
 
-function exportJson(h: Handle, p: {
+async function exportJson(h: Handle, p: {
   sql: string;
   params?: unknown[] | Record<string, unknown>;
   output_path: string;
@@ -539,21 +801,65 @@ function exportJson(h: Handle, p: {
   ndjson?: boolean;
 }) {
   const stmt = h.db.prepare(p.sql);
-  const rows = (p.params !== undefined ? stmt.all(p.params as any) : stmt.all()) as any[];
   const abs = resolveSafePath(p.output_path, "export_json.output_path"); // S1
-  let content: string;
+
   if (p.ndjson) {
-    content = rows.map((r) => JSON.stringify(r)).join("\n") + "\n";
-  } else {
-    content = p.pretty ? JSON.stringify(rows, null, 2) : JSON.stringify(rows);
+    // B6: stream NDJSON straight to disk; never materialize all rows.
+    // Drain via the write callback ONLY — no `once("drain")` parallel path,
+    // which previously could double-resolve when both the callback and the
+    // drain event fired.
+    // B5: enforce MAX_LIMIT cap and surface `truncated`.
+    // B8: serializeRow encodes Buffers as { $blob: <base64> }.
+    const ws = createWriteStream(abs);
+    let count = 0;
+    let bytes = 0;
+    let truncated = false;
+    const drain = (chunk: string): Promise<void> =>
+      new Promise<void>((res, rej) => {
+        ws.write(chunk, "utf8", (err) => {
+          if (err) rej(err); else res();
+        });
+      });
+    try {
+      // C1: callIterate handles named-bind objects correctly.
+      const iter = callIterate(stmt, p.params);
+      for (const row of iter) {
+        if (count >= MAX_LIMIT) { truncated = true; break; }
+        const line = JSON.stringify(serializeRow(row)) + "\n";
+        bytes += Buffer.byteLength(line, "utf8");
+        await drain(line);
+        count++;
+      }
+    } catch (e) {
+      ws.destroy();
+      throw e;
+    }
+    await new Promise<void>((res, rej) => {
+      ws.on("error", rej);
+      ws.on("finish", () => res());
+      ws.end();
+    });
+    return { rows: count, path: abs, bytes, format: "ndjson" as const, truncated };
   }
-  writeFileSync(abs, content, "utf8");
-  return { rows: rows.length, path: abs, bytes: Buffer.byteLength(content, "utf8"), format: p.ndjson ? "ndjson" : "json" };
+
+  // JSON array (regular or pretty) — must materialize. Apply MAX_LIMIT.
+  // C1: callAll handles named-bind objects correctly.
+  const allRows = callAll(stmt, p.params);
+  const truncated = allRows.length > MAX_LIMIT;
+  const rows = (truncated ? allRows.slice(0, MAX_LIMIT) : allRows).map(serializeRow);
+  const content = p.pretty ? JSON.stringify(rows, null, 2) : JSON.stringify(rows);
+  await new Promise<void>((res, rej) => {
+    const ws = createWriteStream(abs);
+    ws.on("error", rej);
+    ws.on("finish", () => res());
+    ws.end(content);
+  });
+  return { rows: rows.length, path: abs, bytes: Buffer.byteLength(content, "utf8"), format: "json" as const, truncated };
 }
 
 function backup(h: Handle, destPath: string) {
   const abs = resolveSafePath(destPath, "backup.dest_path"); // S1
-  return h.db.backup(abs).then((progress: any) => ({
+  return h.db.backup(abs).then((progress) => ({
     path: abs,
     total_pages: progress.totalPages,
     remaining_pages: progress.remainingPages,
@@ -569,7 +875,16 @@ function errContent(msg: string) {
   return { content: [{ type: "text" as const, text: msg }], isError: true };
 }
 
-const server = new McpServer({ name: "sqlite", version: "0.1.0" });
+// B13: include err.code (SQLite SQLITE_* codes) for richer LLM debugging.
+function formatError(err: unknown): string {
+  if (err instanceof Error) {
+    const code = (err as NodeJS.ErrnoException).code ? ` [${(err as NodeJS.ErrnoException).code}]` : "";
+    return `${err.name}${code}: ${err.message}`;
+  }
+  return `Error: ${String(err)}`;
+}
+
+const server = new McpServer({ name: "sqlite", version: PKG_VERSION });
 
 server.tool(
   "sqlite",
@@ -591,6 +906,7 @@ Actions:
 - schema: list all objects (tables/views/indexes/triggers). Pass 'table' to get columns/FKs/indexes for a specific table.
 - pragma: run a PRAGMA query. e.g. "journal_mode", "foreign_keys", "table_list".
 - backup: online backup to 'dest_path'.
+- dump_sql: return CREATE / CREATE INDEX / etc. for full schema export.
 
 params may be an array (positional ?) or object (named @name / :name / $name).`,
   {
@@ -600,6 +916,7 @@ params may be an array (positional ?) or object (named @name / :name / $name).`,
       "schema", "pragma", "backup",
       "explain", "vacuum", "attach", "detach",
       "import_csv", "export_csv", "export_json",
+      "dump_sql",
     ]).describe("Action"),
     name: z.string().optional().describe("DB handle name (default 'default')"),
     path: z.string().optional().describe("open/import_csv: file path"),
@@ -671,7 +988,8 @@ params may be an array (positional ?) or object (named @name / :name / $name).`,
         }
         case "backup": {
           if (!p.dest_path) return errContent("backup requires 'dest_path'");
-          return textContent(await backup(getHandle(p.name), p.dest_path));
+          // B7: track async backup for clean shutdown.
+          return textContent(await trackAsync(() => backup(getHandle(p.name), p.dest_path!)));
         }
         case "explain": {
           if (!p.sql) return errContent("explain requires 'sql'");
@@ -701,31 +1019,55 @@ params may be an array (positional ?) or object (named @name / :name / $name).`,
         }
         case "export_csv": {
           if (!p.sql || !p.output_path) return errContent("export_csv requires 'sql' and 'output_path'");
-          return textContent(exportCsv(getHandle(p.name), {
-            sql: p.sql, params, output_path: p.output_path,
+          // B7: track async export for clean shutdown.
+          return textContent(await trackAsync(() => exportCsv(getHandle(p.name), {
+            sql: p.sql!, params, output_path: p.output_path!,
             delimiter: p.delimiter, header: p.header,
-          }));
+          })));
         }
         case "export_json": {
           if (!p.sql || !p.output_path) return errContent("export_json requires 'sql' and 'output_path'");
-          return textContent(exportJson(getHandle(p.name), {
-            sql: p.sql, params, output_path: p.output_path,
+          // B7: track async export for clean shutdown.
+          return textContent(await trackAsync(() => exportJson(getHandle(p.name), {
+            sql: p.sql!, params, output_path: p.output_path!,
             pretty: p.pretty, ndjson: p.ndjson,
-          }));
+          })));
         }
+        case "dump_sql":
+          return textContent(runDumpSql(getHandle(p.name)));
       }
-    } catch (err: any) {
-      return errContent(`${err?.name ?? "Error"}: ${err?.message ?? String(err)}`);
+    } catch (err) {
+      return errContent(formatError(err));
     }
     return errContent("unreachable");
   },
 );
 
-process.on("SIGINT", () => { for (const h of registry.values()) try { h.db.close(); } catch {} ; process.exit(0); });
-process.on("SIGTERM", () => { for (const h of registry.values()) try { h.db.close(); } catch {} ; process.exit(0); });
+// B12: shutdown handlers — close every open DB.
+// B7: wait for in-flight async ops (export / backup) to drain before close.
+//   - poll every 25ms up to 3000ms; then close regardless.
+let shuttingDown = false;
+let activeTransport: StdioServerTransport | undefined;
+
+async function shutdown(signal: NodeJS.Signals) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  // B5: stop accepting new requests before closing DB handles.
+  try { await activeTransport?.close(); } catch {}
+  const deadline = Date.now() + 3000;
+  while (inflightAsync > 0 && Date.now() < deadline) {
+    await new Promise<void>((res) => setTimeout(res, 25));
+  }
+  closeAllDbs();
+  // Give the event loop a tick to flush stderr.
+  setImmediate(() => process.exit(signal === "SIGINT" ? 130 : 143));
+}
+process.on("SIGINT", () => { void shutdown("SIGINT"); });
+process.on("SIGTERM", () => { void shutdown("SIGTERM"); });
 
 async function main() {
   const transport = new StdioServerTransport();
+  activeTransport = transport;
   await server.connect(transport);
 }
 
